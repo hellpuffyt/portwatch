@@ -1,0 +1,166 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: "test: ${{ matrix.os }}"
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - name: "Install stable toolchain"
+        uses: dtolnay/rust-toolchain@stable
+      - name: "Cache cargo registry and build artifacts"
+        uses: Swatinem/rust-cache@v2
+      # Runs each OS's real platform backend for real: on Linux this
+      # scans the live /proc, on macOS it shells out to the real lsof,
+      # on Windows it calls the real IP Helper API - the platform-
+      # specific code is not just type-checked here, it executes.
+      - name: "Run tests: cargo test --all-targets"
+        run: cargo test --all-targets
+
+  quality:
+    name: "fmt and clippy"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: "Install stable toolchain with clippy and rustfmt"
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - name: "Cache cargo registry and build artifacts"
+        uses: Swatinem/rust-cache@v2
+      - name: "Check formatting: cargo fmt --all -- --check"
+        run: cargo fmt --all -- --check
+      - name: "Lint (this host's own backend): cargo clippy --all-targets -- -D warnings"
+        run: cargo clippy --all-targets -- -D warnings
+      # The Linux and macOS backends are cfg-gated out of a Windows/macOS
+      # build respectively, so linting on ubuntu-latest alone would never
+      # touch the Windows FFI code. Cross-checking (not linking, which
+      # needs a real linker for the target) against every target this
+      # crate supports means every backend's clippy warnings are caught
+      # in CI regardless of which runner's OS matches which backend.
+      - name: "Add cross-check targets"
+        run: rustup target add x86_64-unknown-linux-gnu x86_64-pc-windows-gnu x86_64-apple-darwin
+      - name: "Cross-clippy: Linux backend"
+        run: cargo clippy --target x86_64-unknown-linux-gnu --all-targets -- -D warnings
+      - name: "Cross-clippy: Windows backend"
+        run: cargo clippy --target x86_64-pc-windows-gnu --all-targets -- -D warnings
+      - name: "Cross-clippy: macOS backend"
+        run: cargo clippy --target x86_64-apple-darwin --all-targets -- -D warnings
+
+  dogfood:
+    name: "dogfood: portwatch inventories and diffs its own machine"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: "Install stable toolchain"
+        uses: dtolnay/rust-toolchain@stable
+      - name: "Cache cargo registry and build artifacts"
+        uses: Swatinem/rust-cache@v2
+      - name: "Build release binary"
+        run: cargo build --release
+
+      - name: "--version and --help print exactly what's expected"
+        run: |
+          set -euo pipefail
+          BIN=./target/release/portwatch
+          version_output="$($BIN --version)"
+          test "$version_output" = "portwatch $(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          $BIN --help | grep -qx "USAGE:"
+          $BIN | grep -qx "USAGE:"
+
+      - name: "history with no log yet says exactly that"
+        run: |
+          set -euo pipefail
+          BIN=./target/release/portwatch
+          out="$($BIN history --log /tmp/dogfood-history.jsonl)"
+          test "$out" = "no history yet - run \`portwatch update\` to start logging changes"
+
+      - name: "snapshot captures this real runner, diff against itself is clean"
+        run: |
+          set -euo pipefail
+          BIN=./target/release/portwatch
+          STATE=/tmp/dogfood-state.json
+          $BIN snapshot --state "$STATE"
+          test -s "$STATE"
+          # Real, unmocked call against the live GitHub Actions runner:
+          # assert the output actually parses as the documented shape,
+          # not just that the process exited 0.
+          $BIN scan --json | python3 -c "
+          import json, sys
+          entries = json.load(sys.stdin)
+          assert isinstance(entries, list), entries
+          for e in entries:
+              assert e['protocol'] in ('tcp', 'udp'), e
+              assert isinstance(e['local_port'], int), e
+          "
+          diff_output="$($BIN diff --state "$STATE")"
+          test "$diff_output" = "no changes"
+
+      - name: "editing the snapshot produces an exact, deterministic diff"
+        run: |
+          set -euo pipefail
+          BIN=./target/release/portwatch
+          STATE=/tmp/dogfood-state.json
+          # Add one fabricated entry, on a port nothing on this runner
+          # binds, to the real snapshot captured above. The next diff
+          # must report exactly that one entry removed - this is real
+          # dogfooding of the diff engine (not a canned fixture) layered
+          # on a real captured snapshot.
+          python3 -c "
+          import json
+          with open('$STATE') as f:
+              snap = json.load(f)
+          snap['entries'].append({
+              'protocol': 'tcp',
+              'local_addr': '0.0.0.0',
+              'local_port': 4,
+              'state': 'Listen',
+              'pid': 999999,
+              'process_name': 'definitely-not-running',
+          })
+          with open('$STATE', 'w') as f:
+              json.dump(snap, f)
+          "
+          set +e
+          diff_output="$($BIN diff --state "$STATE")"
+          code=$?
+          set -e
+          test "$code" = "2"
+          expected="- tcp/0.0.0.0:4 no longer listening (was definitely-not-running (999999))"
+          echo "$diff_output" | grep -qF "$expected"
+
+      - name: "update saves a fresh baseline and clears the diff"
+        run: |
+          set -euo pipefail
+          BIN=./target/release/portwatch
+          STATE=/tmp/dogfood-state.json
+          LOG=/tmp/dogfood-history.jsonl
+          rm -f "$LOG"
+          out="$($BIN update --state "$STATE" --log "$LOG")"
+          echo "$out" | grep -qF "no longer listening"
+          test -s "$LOG"
+          # The baseline is now current, so a second diff is clean.
+          second="$($BIN diff --state "$STATE")"
+          test "$second" = "no changes"
+
+      - name: "cargo run --example diff_two_snapshots prints the documented output"
+        run: |
+          set -euo pipefail
+          out="$(cargo run --release --example diff_two_snapshots)"
+          echo "$out" | grep -qF "~ tcp/0.0.0.0:80 owner changed: nginx (1200) -> nginx (1955)"
+          echo "$out" | grep -qF "- tcp/0.0.0.0:5432 no longer listening (was postgres (1400))"
+          echo "$out" | grep -qF "+ tcp/0.0.0.0:9090 now listening (metrics-exporter (2001))"
+          echo "$out" | grep -qF "1 added, 1 removed, 1 owner change(s)"
