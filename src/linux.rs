@@ -256,7 +256,7 @@ mod tests {
     #[test]
     fn parses_ipv6_unspecified() {
         assert_eq!(
-            parse_ipv6_hex("00000000000000000000000000000000"),
+            parse_ipv6_hex("0000000000000000000000000000000000"),
             None,
             "34 hex chars is the wrong length and must be rejected"
         );

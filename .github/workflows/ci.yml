@@ -140,7 +140,7 @@ jobs:
           set -e
           test "$code" = "2"
           expected="- tcp/0.0.0.0:4 no longer listening (was definitely-not-running (999999))"
-          echo "$diff_output" | grep -qF "$expected"
+          echo "$diff_output" | grep -qF -- "$expected"
 
       - name: "update saves a fresh baseline and clears the diff"
         run: |
@@ -161,6 +161,6 @@ jobs:
           set -euo pipefail
           out="$(cargo run --release --example diff_two_snapshots)"
           echo "$out" | grep -qF "~ tcp/0.0.0.0:80 owner changed: nginx (1200) -> nginx (1955)"
-          echo "$out" | grep -qF "- tcp/0.0.0.0:5432 no longer listening (was postgres (1400))"
+          echo "$out" | grep -qF -- "- tcp/0.0.0.0:5432 no longer listening (was postgres (1400))"
           echo "$out" | grep -qF "+ tcp/0.0.0.0:9090 now listening (metrics-exporter (2001))"
           echo "$out" | grep -qF "1 added, 1 removed, 1 owner change(s)"
