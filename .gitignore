@@ -1,0 +1,8 @@
+/target
+**/*.rs.bk
+*.pdb
+
+# Snapshot/history files produced by running the tool in the working tree.
+/portwatch-state.json
+/portwatch-history.jsonl
+/*.portwatch.json
