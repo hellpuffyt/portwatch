@@ -149,7 +149,14 @@ jobs:
           STATE=/tmp/dogfood-state.json
           LOG=/tmp/dogfood-history.jsonl
           rm -f "$LOG"
+          set +e
           out="$($BIN update --state "$STATE" --log "$LOG")"
+          code=$?
+          set -e
+          # update reports the same "no longer listening" change one
+          # last time (against the still-fabricated baseline) before
+          # writing a fresh one, so it exits 2 like `diff` did above.
+          test "$code" = "2"
           echo "$out" | grep -qF "no longer listening"
           test -s "$LOG"
           # The baseline is now current, so a second diff is clean.
