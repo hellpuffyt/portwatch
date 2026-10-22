@@ -77,50 +77,86 @@ fn diff_without_a_snapshot_fails_with_a_helpful_message() {
         .stderr(predicate::str::contains("portwatch snapshot"));
 }
 
+/// The port table is live system state: on a busy machine another
+/// process can genuinely open or close a listener between two scans a
+/// few milliseconds apart (observed on a shared CI-class host). A test of
+/// "unchanged system => no changes" therefore retries a few times and
+/// requires one clean attempt. A real diff bug - e.g. reporting changes
+/// for an unchanged table, like the shared-port flip-flop in
+/// `src/diff.rs` - fails every attempt.
+const LIVE_ATTEMPTS: usize = 5;
+
 #[test]
 fn snapshot_then_diff_against_itself_reports_no_changes() {
-    let dir = tempfile::tempdir().unwrap();
-    let state = dir.path().join("state.json");
+    let mut last = String::new();
+    for _ in 0..LIVE_ATTEMPTS {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state.json");
+        cmd()
+            .args(["snapshot", "--state"])
+            .arg(&state)
+            .assert()
+            .success();
+        assert!(state.exists());
 
-    cmd()
-        .args(["snapshot", "--state"])
-        .arg(&state)
-        .assert()
-        .success();
-    assert!(state.exists());
-
-    cmd()
-        .args(["diff", "--state"])
-        .arg(&state)
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("no changes"));
+        let out = cmd()
+            .args(["diff", "--state"])
+            .arg(&state)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        match out.status.code() {
+            Some(0) => {
+                assert!(stdout.contains("no changes"), "{stdout}");
+                return;
+            }
+            Some(2) => last = stdout, // live churn between the two scans
+            other => panic!("unexpected exit {other:?}: {stdout}"),
+        }
+    }
+    panic!("diff reported changes on every one of {LIVE_ATTEMPTS} attempts:\n{last}");
 }
 
 #[test]
 fn update_saves_a_new_snapshot_and_reports_no_changes_the_first_time() {
-    let dir = tempfile::tempdir().unwrap();
-    let state = dir.path().join("state.json");
-    let log = dir.path().join("history.jsonl");
+    let mut last = String::new();
+    for _ in 0..LIVE_ATTEMPTS {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state.json");
+        let log = dir.path().join("history.jsonl");
 
-    cmd()
-        .args(["snapshot", "--state"])
-        .arg(&state)
-        .assert()
-        .success();
+        cmd()
+            .args(["snapshot", "--state"])
+            .arg(&state)
+            .assert()
+            .success();
 
-    cmd()
-        .args(["update", "--state"])
-        .arg(&state)
-        .args(["--log"])
-        .arg(&log)
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("no changes"));
-
-    // Nothing changed between the two captures, so the (append-only,
-    // changes-only) history log should not have been created.
-    assert!(!log.exists());
+        let out = cmd()
+            .args(["update", "--state"])
+            .arg(&state)
+            .args(["--log"])
+            .arg(&log)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        match out.status.code() {
+            Some(0) => {
+                assert!(stdout.contains("no changes"), "{stdout}");
+                // Nothing changed between the two captures, so the
+                // (append-only, changes-only) history log should not have
+                // been created.
+                assert!(!log.exists());
+                return;
+            }
+            Some(2) => {
+                // Changes were seen, so the log must exist and hold them.
+                assert!(log.exists(), "exit 2 must append to the history log");
+                last = stdout;
+            }
+            other => panic!("unexpected exit {other:?}: {stdout}"),
+        }
+    }
+    panic!("update reported changes on every one of {LIVE_ATTEMPTS} attempts:\n{last}");
 }
 
 #[test]
@@ -140,7 +176,13 @@ fn diff_json_output_is_a_valid_diff_report() {
         .args(["--json"])
         .output()
         .unwrap();
-    assert!(output.status.success());
+    // 0 = no changes, 2 = changes found (both documented successes); the
+    // live table may legitimately change between the two scans.
+    assert!(
+        matches!(output.status.code(), Some(0 | 2)),
+        "exit {:?}",
+        output.status.code()
+    );
     let text = String::from_utf8(output.stdout).unwrap();
     let parsed: serde_json::Value = serde_json::from_str(&text).expect("valid JSON");
     assert!(parsed.get("changes").is_some());

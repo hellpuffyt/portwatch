@@ -8,12 +8,15 @@
 //! trying to tell the protocols apart after the fact) and parses the
 //! normal human-readable columns.
 //!
-//! Parsing those columns by position rather than a fixed byte offset is
-//! required because the `COMMAND` column can itself contain spaces
-//! (`"Google Chrome Helper"`, `com.docker.backend`) - see
-//! [`parse_line`], which instead peels known single-token fields off the
-//! *end* of the line and treats whatever remains at the start as the
-//! command name.
+//! Parsing those columns by position rather than a fixed byte offset
+//! keeps the parser robust to column widths. `lsof` prints spaces and
+//! other non-printable bytes in the `COMMAND` column as `\xNN` escapes
+//! (`Brave\x20Browser`), which `unescape_lsof` decodes, and is invoked
+//! with `+c 0` so the name is not truncated to its default 9 characters.
+//! `parse_line` still peels known single-token fields off the *end* of the
+//! line and treats whatever remains at the start as the command name.
+//! UDP rows with a peer (`local->remote`) are connected client sockets and
+//! are skipped.
 //!
 //! The parser is pure and fixture-tested below against real captured
 //! `lsof` output (`tests/fixtures/macos/`). The `Command` invocation
@@ -49,14 +52,14 @@ fn parse_line(line: &str, protocol: Protocol) -> Option<PortEntry> {
     let node = tokens.pop()?; // "TCP" or "UDP"
     let _size_off = tokens.pop()?;
     let _device = tokens.pop()?;
-    let _file_type = tokens.pop()?; // "IPv4" / "IPv6"
+    let file_type = tokens.pop()?; // "IPv4" / "IPv6"
     let _fd = tokens.pop()?;
     let _user = tokens.pop()?;
     let pid_token = tokens.pop()?;
     if tokens.is_empty() {
         return None; // no COMMAND left
     }
-    let command = tokens.join(" ");
+    let command = unescape_lsof(&tokens.join(" "));
 
     let line_protocol = match node {
         "TCP" => Protocol::Tcp,
@@ -68,10 +71,26 @@ fn parse_line(line: &str, protocol: Protocol) -> Option<PortEntry> {
     }
 
     let pid: u32 = pid_token.parse().ok()?;
-    let (local, _remote) = name
+    let (local, remote) = name
         .split_once("->")
         .map_or((name, None), |(l, r)| (l, Some(r)));
-    let (addr, port) = parse_endpoint(local)?;
+    // A UDP socket with a peer (`local->remote`) is a connected client
+    // socket - a DNS query, a QUIC connection - not something listening.
+    // Counting those made every scan on a machine with a browser open
+    // differ from the last one.
+    if protocol == Protocol::Udp && remote.is_some() {
+        return None;
+    }
+    let (mut addr, port) = parse_endpoint(local)?;
+    // lsof prints the wildcard as `*` for both families; the TYPE column
+    // says which one it is. Without this an IPv6 `[::]:22` listener was
+    // reported as a second `0.0.0.0:22` row.
+    if file_type == "IPv6"
+        && addr == IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
+        && local.starts_with('*')
+    {
+        addr = IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED);
+    }
 
     let state = state_token
         .and_then(|t| t.strip_prefix('(').and_then(|t| t.strip_suffix(')')))
@@ -85,6 +104,33 @@ fn parse_line(line: &str, protocol: Protocol) -> Option<PortEntry> {
         pid: Some(pid),
         process_name: Some(command),
     })
+}
+
+/// Undo `lsof`'s escaping of the COMMAND column: non-printable bytes,
+/// *including spaces*, are printed as `\xNN` (so `Brave Browser` arrives
+/// as `Brave\x20Browser`). Anything that is not a well-formed `\xNN`
+/// sequence is kept verbatim.
+fn unescape_lsof(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' && bytes.get(i + 1) == Some(&b'x') {
+            if let Some(b) = bytes
+                .get(i + 2..i + 4)
+                .filter(|h| h.iter().all(u8::is_ascii_hexdigit))
+                .and_then(|h| std::str::from_utf8(h).ok())
+                .and_then(|h| u8::from_str_radix(h, 16).ok())
+            {
+                out.push(b);
+                i += 4;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// Parse a `host:port` endpoint as `lsof` prints it: `*:8080`,
@@ -131,8 +177,23 @@ fn parse_lsof_output(output: &str, protocol: Protocol) -> Vec<PortEntry> {
         .collect()
 }
 
+/// Where macOS ships `lsof`.
+const SYSTEM_LSOF: &str = "/usr/sbin/lsof";
+
 fn run_lsof(proto_flag: &str) -> io::Result<String> {
-    let output = Command::new("lsof").args(["-nP", proto_flag]).output()?;
+    // Prefer the system binary over a PATH lookup: portwatch is often run
+    // as root from cron, where a writable directory early in PATH would
+    // otherwise decide what gets executed.
+    let lsof = if std::path::Path::new(SYSTEM_LSOF).exists() {
+        SYSTEM_LSOF
+    } else {
+        "lsof"
+    };
+    // `+c 0` asks for the full command name; by default lsof truncates it
+    // to 9 characters (`com.docke`, `Brave\x20`).
+    let output = Command::new(lsof)
+        .args(["+c", "0", "-nP", proto_flag])
+        .output()?;
     // lsof exits 1 when it finds nothing to list, which is a normal
     // "no matching sockets" result, not a failure - only a missing
     // binary or a genuine crash (signal, code >1) is an error.
@@ -267,5 +328,52 @@ mod tests {
     fn line_with_unparseable_pid_is_ignored() {
         let line = "launchd notapid root 6u IPv4 0x1 0t0 TCP *:22 (LISTEN)";
         assert_eq!(parse_line(line, Protocol::Tcp), None);
+    }
+
+    #[test]
+    fn lsof_escaped_command_names_are_decoded() {
+        // lsof prints spaces in COMMAND as `\x20` (observed on macOS 27).
+        let line =
+            "Brave\\x20Browser\\x20Helper 850 user 26u IPv4 0x8770d152b0ff638a 0t0 UDP *:5353";
+        let e = parse_line(line, Protocol::Udp).expect("parses");
+        assert_eq!(e.process_name.as_deref(), Some("Brave Browser Helper"));
+        assert_eq!(e.local_port, 5353);
+        assert_eq!(
+            unescape_lsof("a\\xZZb\\x4"),
+            "a\\xZZb\\x4",
+            "malformed escapes kept"
+        );
+        assert_eq!(
+            unescape_lsof("a\\x+1b"),
+            "a\\x+1b",
+            "sign is not a hex digit"
+        );
+    }
+
+    #[test]
+    fn connected_udp_rows_are_not_listeners() {
+        let connected = "Brave\\x20Browser 850 user 34u IPv4 0xdb66b2f92c2f8126 0t0 UDP 192.168.1.108:65418->160.79.104.10:443";
+        assert_eq!(parse_line(connected, Protocol::Udp), None);
+        let unbound = "identityservicesd 639 user 10u IPv4 0xc4840c563a9d8c9d 0t0 UDP *:*";
+        assert_eq!(parse_line(unbound, Protocol::Udp), None);
+        // TCP rows with a peer are still parsed; `is_listening` filters them.
+        let tcp = "curl 4242 user 5u IPv4 0x1 0t0 TCP 10.0.0.2:50000->10.0.0.1:443 (ESTABLISHED)";
+        assert_eq!(
+            parse_line(tcp, Protocol::Tcp).and_then(|e| e.state),
+            Some(TcpState::Established)
+        );
+    }
+
+    #[test]
+    fn ipv6_wildcard_is_not_reported_as_ipv4() {
+        let entries = parse_lsof_output(FIXTURE_TCP, Protocol::Tcp);
+        let ssh: Vec<_> = entries.iter().filter(|e| e.local_port == 22).collect();
+        assert_eq!(ssh.len(), 2);
+        assert!(ssh
+            .iter()
+            .any(|e| e.local_addr == IpAddr::V4(Ipv4Addr::UNSPECIFIED)));
+        assert!(ssh
+            .iter()
+            .any(|e| e.local_addr == IpAddr::V6(Ipv6Addr::UNSPECIFIED)));
     }
 }
