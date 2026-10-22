@@ -58,8 +58,8 @@ of them IPv6 wildcards that were previously mislabelled `0.0.0.0`.
 | `cargo audit --db <local advisory-db> --no-fetch` | 0 | 0 vulnerabilities |
 | `cargo deny check` | — | not configured |
 
-On macOS the 80 tests are: lib 64 (model/diff/format/storage/timefmt/
-macos), `tests/cli.rs` 14, example + doc targets 0. Linux-only tests
+On macOS the 80 tests are: lib 60 (model/diff/format/storage/timefmt/
+macos), binary unit tests 6, `tests/cli.rs` 14. Linux-only tests
 (`src/linux.rs`, including the new connected-UDP test) do not compile on
 macOS and were not executed.
 
