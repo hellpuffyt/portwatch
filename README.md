@@ -122,7 +122,7 @@ fallback pretending to be a syscall:
 
 | | Linux | Windows | macOS |
 | --- | --- | --- | --- |
-| Mechanism | reads `/proc/net/{tcp,tcp6,udp,udp6}`, walks `/proc/<pid>/fd` for ownership | calls `GetExtendedTcpTable`/`GetExtendedUdpTable` (IP Helper API) directly via FFI, `CreateToolhelp32Snapshot` for names | runs `lsof -nP -iTCP` / `-iUDP` and parses its columns |
+| Mechanism | reads `/proc/net/{tcp,tcp6,udp,udp6}`, walks `/proc/<pid>/fd` for ownership | calls `GetExtendedTcpTable`/`GetExtendedUdpTable` (IP Helper API) directly via FFI, `CreateToolhelp32Snapshot` for names | runs `/usr/sbin/lsof +c 0 -nP -iTCP` / `-iUDP` and parses its columns |
 | Sees all ports unprivileged | mostly - fd ownership needs matching uid or root | yes | no - only sockets the caller can see |
 | IPv4-mapped IPv6 (`::ffff:127.0.0.1`) | parsed correctly | parsed correctly | parsed correctly |
 
@@ -133,21 +133,36 @@ Sharp edges, stated rather than hidden:
   `process_name` left `null` - never silently dropped. This is exercised
   end-to-end by a test that scans a fixture `/proc` tree containing
   exactly that case (`src/linux.rs::full_scan_over_fixture_proc_tree_*`).
-- **macOS:** `lsof`'s `COMMAND` column can itself contain spaces
-  (`Google Chrome Helper`, `com.docker.backend`); the parser peels known
-  fields off the *end* of each line rather than splitting naively, so
-  the command name is never truncated or misread. Verified against real
-  captured `lsof -F`-free column output in `tests/fixtures/macos/`.
+- **macOS:** `lsof` truncates `COMMAND` to 9 characters unless asked
+  not to, and prints spaces in it as `\x20` (`Brave\x20Browser`).
+  portwatch passes `+c 0` and decodes the escapes. The wildcard address
+  is printed as `*` for both IPv4 and IPv6, so the `TYPE` column is used
+  to report `::` vs `0.0.0.0`. Unprivileged `lsof` only shows sockets of
+  processes the caller may inspect - run as root to see system daemons.
+  The parser is tested against fixture lines in `tests/fixtures/macos/`
+  and inline cases; `scan` was also run live on macOS 27.
 - **Windows:** a UDP port can have more than one simultaneous owner (see
   the shared-port story above) - the diff engine, not the source, is
   where that gets handled correctly.
-- **UDP has no "LISTEN" state anywhere.** portwatch treats every UDP
-  socket the OS reports as bound as a "listener" for diffing purposes.
-  On Windows this includes ephemeral outbound sockets a browser opens
-  and closes constantly (observed directly while writing this README -
-  a machine with an active browser produces UDP diff noise on high
-  ephemeral ports between any two scans a few seconds apart). If that
-  matters to you, filter `--json` output by port range before comparing.
+- **UDP has no "LISTEN" state anywhere.** portwatch treats every bound
+  UDP socket *without a peer* as a "listener" for diffing purposes. On
+  Linux and macOS, connected UDP sockets (a DNS lookup, a QUIC
+  connection - `rem_address` set, or `local->remote` in `lsof`) are
+  skipped. Windows' UDP table carries no peer, so there it still includes
+  ephemeral outbound sockets a browser opens and closes constantly
+  (observed directly while writing this README - a machine with an
+  active browser produces UDP diff noise on high ephemeral ports between
+  any two scans a few seconds apart). If that matters to you, filter
+  `--json` output by port range before comparing.
+
+### Privileges
+
+Nothing in portwatch requires root, and the test suite runs unprivileged.
+What an unprivileged scan can *see* differs by OS: Linux reports every
+socket but cannot name the owner of another user's socket (`pid`/
+`process_name` are `null`); macOS `lsof` omits other users' sockets
+entirely; Windows reports everything. For a complete inventory run it
+as root / Administrator.
 
 ## The snapshot format
 
@@ -213,7 +228,7 @@ suite exercises it.
 ## Development
 
 ```bash
-cargo test                            # 71 tests: unit + full-pipeline fixtures + CLI
+cargo test                            # unit + full-pipeline fixtures + CLI (80 on macOS)
 cargo clippy --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
