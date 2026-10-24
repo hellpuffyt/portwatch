@@ -7,7 +7,7 @@
 //! formatting) are fully unit-tested independent of any operating
 //! system, while the platform-specific "go actually ask the kernel"
 //! backends live behind the [`source::PortSource`] trait in their own
-//! modules ([`linux`], [`windows`], [`macos`]).
+//! modules (`linux`, `windows`, `macos`; each compiled only on its own OS).
 
 pub mod diff;
 pub mod format;

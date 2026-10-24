@@ -67,6 +67,8 @@ fn parse_addr_port(field: &str, v6: bool) -> Option<(IpAddr, u16)> {
 struct RawSocket {
     local_addr: IpAddr,
     local_port: u16,
+    /// Port of `rem_address`; non-zero means the socket has a peer.
+    remote_port: u16,
     state: u32,
     inode: u64,
 }
@@ -89,6 +91,7 @@ fn parse_proc_net(content: &str, v6: bool) -> Vec<RawSocket> {
         let Some((local_addr, local_port)) = parse_addr_port(fields[1], v6) else {
             continue;
         };
+        let remote_port = parse_addr_port(fields[2], v6).map_or(0, |(_, port)| port);
         let Ok(state) = u32::from_str_radix(fields[3], 16) else {
             continue;
         };
@@ -98,11 +101,20 @@ fn parse_proc_net(content: &str, v6: bool) -> Vec<RawSocket> {
         out.push(RawSocket {
             local_addr,
             local_port,
+            remote_port,
             state,
             inode,
         });
     }
     out
+}
+
+/// A connected UDP socket (one with a peer in `rem_address`) is an
+/// outbound client - a DNS lookup, a QUIC connection - not a listener, so
+/// it is not reported. TCP rows are all kept; filtering to `LISTEN`
+/// happens later, as on every platform.
+fn is_reportable(protocol: Protocol, raw: &RawSocket) -> bool {
+    !(protocol == Protocol::Udp && raw.remote_port != 0)
 }
 
 /// Build an `inode -> pid` map by walking `/proc/<pid>/fd/*` and
@@ -201,6 +213,9 @@ impl PortSource for LinuxSource {
                 Ok(content) => {
                     any_ok = true;
                     for raw in parse_proc_net(&content, v6) {
+                        if !is_reportable(protocol, &raw) {
+                            continue;
+                        }
                         let pid = owners.get(&raw.inode).copied();
                         let process_name = pid.and_then(|p| {
                             name_cache
@@ -403,5 +418,27 @@ mod tests {
             .find(|e| e.state == Some(TcpState::Established))
             .expect("established row present");
         assert_eq!(established.local_port, 0xC1B2);
+    }
+
+    #[test]
+    fn connected_udp_sockets_are_not_reported_as_listeners() {
+        let udp = "  sl  local_address rem_address   st\n\
+   1: 0100007F:E1F5 0100007F:0035 01 00000000:00000000 00:00000000 00000000  1000        0 555 2 0000000000000000 0\n\
+   2: 00000000:14E9 00000000:0000 07 00000000:00000000 00:00000000 00000000   115        0 556 2 0000000000000000 0\n";
+        let rows = parse_proc_net(udp, false);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].remote_port, 53);
+        assert!(
+            !is_reportable(Protocol::Udp, &rows[0]),
+            "connected client socket"
+        );
+        assert!(
+            is_reportable(Protocol::Udp, &rows[1]),
+            "bound, unconnected socket"
+        );
+        assert!(
+            is_reportable(Protocol::Tcp, &rows[0]),
+            "TCP is filtered by state later"
+        );
     }
 }

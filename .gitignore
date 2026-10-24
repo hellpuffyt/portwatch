@@ -6,3 +6,7 @@
 /portwatch-state.json
 /portwatch-history.jsonl
 /*.portwatch.json
+
+*.profraw
+.env*
+.DS_Store

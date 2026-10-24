@@ -4,6 +4,31 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- macOS: IPv6 wildcard listeners (`lsof` prints `*` for both families)
+  were reported as a second `0.0.0.0` row; the `TYPE` column now decides.
+- macOS: process names were truncated to 9 characters and kept `lsof`'s
+  `\x20` escapes (`Brave\x20`); `lsof` now runs with `+c 0` and escapes
+  are decoded.
+- macOS and Linux: connected UDP client sockets (DNS lookups, QUIC) were
+  reported as listeners, making two back-to-back scans differ; sockets
+  with a peer are now skipped.
+- macOS: `lsof` is run from `/usr/sbin/lsof` when present instead of the
+  first `lsof` on `PATH`.
+- `cargo doc` failed under `-D warnings` (links to cfg-gated/private items).
+- CLI tests that compare two live scans failed on a busy machine; they
+  now tolerate genuine churn between scans (retrying, and accepting the
+  documented exit code 2 where only the JSON shape is under test).
+
+### Added
+
+- README: a Privileges section describing what an unprivileged scan sees
+  on each OS. `SECURITY.md`, `.editorconfig`,
+  `docs/PRODUCTION_READINESS.md`.
+
 ## [0.1.0] - 2026-09-01
 
 First release.
