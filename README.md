@@ -3,14 +3,46 @@
 Inventory listening TCP/UDP ports and the processes that own them, and
 report exactly what changed since the last snapshot.
 
+**Status:** version 0.1.0, a small CLI and library. Linux, macOS and Windows
+backends, tested in CI on all three. Not published to crates.io: the
+`portwatch` crate there is an unrelated TUI, so install from a clone.
+
 ```bash
-cargo install --path .
+git clone https://github.com/hellpuffyt/portwatch && cd portwatch
+cargo install --path .            # needs Rust 1.87 or newer
 ```
 
 ```bash
 portwatch snapshot                # today: saves portwatch-state.json
 # ... a week later ...
 portwatch diff                    # what moved?
+```
+
+## Demo
+
+<img src="docs/screenshots/live-update-macos.png" width="100%" alt="Terminal capture on macOS: portwatch snapshot saves 40 listening ports; after starting python3 -m http.server on 127.0.0.1:8765, portwatch update reports + tcp/127.0.0.1:8765 now listening (Python); after kill %1, the next update reports it is no longer listening.">
+
+*Real capture on macOS: a baseline, then a local HTTP server appears and
+disappears. Other processes on this machine open short-lived listeners all
+the time, so the `update` output is filtered to the demo port with `grep`;
+`update` still saved the full snapshot and logged every change.*
+
+<img src="docs/screenshots/example-diff-two-snapshots.png" width="100%" alt="Terminal capture: cargo run --example diff_two_snapshots prints an owner change on tcp/0.0.0.0:80 from nginx 1200 to nginx 1955, postgres on 5432 no longer listening, metrics-exporter on 9090 now listening, and the summary 1 added, 1 removed, 1 owner change(s).">
+
+*`cargo run --example diff_two_snapshots`: the diff engine on two snapshots
+built in code, with no live system access.*
+
+The same sessions as text:
+
+```console
+$ portwatch snapshot --state demo-state.json
+saved 40 listening port(s) to demo-state.json
+$ python3 -m http.server 8765 --bind 127.0.0.1 >/dev/null 2>&1 &
+$ portwatch update --state demo-state.json --log demo-history.jsonl | grep ':8765 '
++ tcp/127.0.0.1:8765 now listening (Python (15120))
+$ kill %1
+$ portwatch update --state demo-state.json --log demo-history.jsonl | grep ':8765 '
+- tcp/127.0.0.1:8765 no longer listening (was Python (15120))
 ```
 
 ## Why this and not the 1000 `netstat` clones
@@ -32,7 +64,7 @@ Two decisions carry the design:
 Process ids get recycled on every restart. Key on the pid and a routine
 `systemctl restart nginx` looks like a removal plus an addition. portwatch
 keys on the socket, so a restart is a single, high-signal `OwnerChanged`
-event naming the old and new pid - which is also what it looks like when
+event naming the old and new pid. That is also what it looks like when
 something *replaces* a service on a well-known port, the case this tool
 actually exists to catch:
 
@@ -41,7 +73,7 @@ actually exists to catch:
 ```
 
 **A port can have more than one simultaneous owner, and the diff has to
-handle that correctly.** This one wasn't a design decision up front - it
+handle that correctly.** This one wasn't a design decision up front. It
 was a bug I hit while dogfooding the first version on my own machine.
 Windows was reporting the UDP mDNS port (`:5353`) as owned by two
 different processes (`steamwebhelper.exe` and `brave.exe`, both bound
@@ -56,16 +88,18 @@ key: a stable shared port produces no changes regardless of scan order,
 a co-owner joining or leaving is `Added`/`Removed`, and only a clean
 single-owner-to-single-owner handoff is reported as `OwnerChanged`. It's
 covered by four tests built directly from that failure
-(`src/diff.rs::tests`, search `shared_port`).
+(`src/diff.rs::tests`, search `shared`).
 
 ## Commands
 
 ```text
-portwatch scan       [--json]                 print current listening ports
-portwatch snapshot    [--state PATH] [--json]  capture and save a baseline
-portwatch diff        [--state PATH] [--json]  compare live ports to the baseline
-portwatch update      [--state PATH] [--log PATH] [--json]   diff, then re-save the baseline
-portwatch history     [--log PATH] [--json]    print previously logged changes
+portwatch scan      [--json]                             print current listening ports
+portwatch snapshot  [--state PATH] [--json]              capture and save a baseline
+portwatch diff      [--state PATH] [--json]              compare live ports to the baseline
+portwatch update    [--state PATH] [--log PATH] [--json] diff, log, then re-save the baseline
+portwatch history   [--log PATH] [--json]                print previously logged changes
+portwatch help | -h | --help                             print usage
+portwatch -V | --version                                 print the version
 ```
 
 | Flag | Effect |
@@ -79,7 +113,7 @@ Exit codes are part of the interface:
 | Code | Meaning |
 | --- | --- |
 | 0 | success; for `diff`/`update`, no changes were found |
-| 1 | an error occurred (I/O, unsupported platform, unreadable snapshot) |
+| 1 | an error occurred (I/O, unsupported platform, missing or unreadable snapshot, unknown command or option) |
 | 2 | success; for `diff`/`update`, at least one change was found |
 
 That makes `diff`/`update` drop straight into a cron line or a CI step:
@@ -87,8 +121,8 @@ That makes `diff`/`update` drop straight into a cron line or a CI step:
 
 ## Real output
 
-`portwatch scan` on the machine this README was written on (121 rows in
-full; here are the first ten):
+`portwatch scan` on the Windows machine where this README was first written
+(121 rows in full; here are the first ten):
 
 ```text
 PROTO  ADDRESS                    PORT   STATE   PROCESS
@@ -105,7 +139,7 @@ tcp    0.0.0.0                    49666  LISTEN  svchost.exe (3332)
 ```
 
 `cargo run --example diff_two_snapshots` builds two snapshots in code (no
-live system access) and diffs them - actual output:
+live system access) and diffs them. Its stdout:
 
 ```text
 ~ tcp/0.0.0.0:80 owner changed: nginx (1200) -> nginx (1955)
@@ -117,20 +151,20 @@ live system access) and diffs them - actual output:
 
 ## Platform support, honestly
 
-One `PortSource` trait, three real backends - no `netstat`-parsing
+One `PortSource` trait, three real backends, and no `netstat`-parsing
 fallback pretending to be a syscall:
 
 | | Linux | Windows | macOS |
 | --- | --- | --- | --- |
 | Mechanism | reads `/proc/net/{tcp,tcp6,udp,udp6}`, walks `/proc/<pid>/fd` for ownership | calls `GetExtendedTcpTable`/`GetExtendedUdpTable` (IP Helper API) directly via FFI, `CreateToolhelp32Snapshot` for names | runs `/usr/sbin/lsof +c 0 -nP -iTCP` / `-iUDP` and parses its columns |
-| Sees all ports unprivileged | mostly - fd ownership needs matching uid or root | yes | no - only sockets the caller can see |
+| Sees all ports unprivileged | mostly: fd ownership needs matching uid or root | yes | no, only sockets the caller can see |
 | IPv4-mapped IPv6 (`::ffff:127.0.0.1`) | parsed correctly | parsed correctly | parsed correctly |
 
 Sharp edges, stated rather than hidden:
 
 - **Linux:** a socket whose owning process you can't read `/proc/<pid>/fd`
   for (different user, no permission) is still reported, with `pid` and
-  `process_name` left `null` - never silently dropped. This is exercised
+  `process_name` left `null`, never silently dropped. This is exercised
   end-to-end by a test that scans a fixture `/proc` tree containing
   exactly that case (`src/linux.rs::full_scan_over_fixture_proc_tree_*`).
 - **macOS:** `lsof` truncates `COMMAND` to 9 characters unless asked
@@ -138,19 +172,20 @@ Sharp edges, stated rather than hidden:
   portwatch passes `+c 0` and decodes the escapes. The wildcard address
   is printed as `*` for both IPv4 and IPv6, so the `TYPE` column is used
   to report `::` vs `0.0.0.0`. Unprivileged `lsof` only shows sockets of
-  processes the caller may inspect - run as root to see system daemons.
+  processes the caller may inspect; run as root to see system daemons.
   The parser is tested against fixture lines in `tests/fixtures/macos/`
-  and inline cases; `scan` was also run live on macOS 27.
+  and inline cases; `scan`, `snapshot`, `diff`, `update` and `history` were
+  also run live on macOS 27.
 - **Windows:** a UDP port can have more than one simultaneous owner (see
-  the shared-port story above) - the diff engine, not the source, is
-  where that gets handled correctly.
+  the shared-port story above). The diff engine, not the source, is
+  where that gets handled.
 - **UDP has no "LISTEN" state anywhere.** portwatch treats every bound
   UDP socket *without a peer* as a "listener" for diffing purposes. On
   Linux and macOS, connected UDP sockets (a DNS lookup, a QUIC
-  connection - `rem_address` set, or `local->remote` in `lsof`) are
+  connection: `rem_address` set, or `local->remote` in `lsof`) are
   skipped. Windows' UDP table carries no peer, so there it still includes
   ephemeral outbound sockets a browser opens and closes constantly
-  (observed directly while writing this README - a machine with an
+  (observed directly while writing this README: a machine with an
   active browser produces UDP diff noise on high ephemeral ports between
   any two scans a few seconds apart). If that matters to you, filter
   `--json` output by port range before comparing.
@@ -186,7 +221,7 @@ Plain JSON, safe to commit or diff with `git diff`:
 ```
 
 `portwatch update` also appends one line of JSON per non-empty diff to a
-history log (`portwatch-history.jsonl` by default) - an append-only audit
+history log (`portwatch-history.jsonl` by default), an append-only audit
 trail of exactly which ports changed and when, without needing a
 database.
 
@@ -222,8 +257,8 @@ assert_eq!(report.added_count(), 1);
 
 Implement `portwatch::source::PortSource` to plug in another platform
 backend, or build `portwatch::model::Snapshot` values by hand (as above)
-to drive the diff engine from fixed data - which is exactly how the test
-suite exercises it.
+to drive the diff engine from fixed data, which is how the test suite
+exercises it.
 
 ## Development
 
@@ -234,7 +269,7 @@ cargo fmt --all -- --check
 ```
 
 Runtime dependencies are `serde`/`serde_json` (the snapshot format) plus,
-Windows-only, `windows-sys` (the IP Helper FFI bindings) - nothing else.
+Windows-only, `windows-sys` (the IP Helper FFI bindings). Nothing else.
 The argument parser, the diff engine, and the ISO-8601 timestamp
 formatter are all hand-rolled in this repo rather than pulled in, so
 there's nothing to audit that isn't right here.
@@ -242,8 +277,18 @@ there's nothing to audit that isn't right here.
 The Linux and macOS backends type-check and run their fixture-driven
 tests under `cargo check --target <triple> --tests` even when built on a
 different host (that's how they were developed and verified here, on
-Windows); CI runs each backend's real test suite natively on its own OS.
+Windows); CI runs each backend's real test suite natively on its own OS,
+clippy-checks all three targets from one Linux runner, and a dogfood job
+on Linux builds the release binary and runs it against that runner's own
+ports.
+
+macOS needs `/usr/sbin/lsof`, which ships with the OS.
+
+## Contributing and security
+
+See [CONTRIBUTING.md](CONTRIBUTING.md). Report vulnerabilities privately as
+described in [SECURITY.md](SECURITY.md).
 
 ## License
 
-MIT - see [LICENSE](LICENSE).
+MIT, see [LICENSE](LICENSE).
